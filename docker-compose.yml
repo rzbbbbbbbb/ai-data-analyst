@@ -1,0 +1,22 @@
+# ============================================================
+# Docker Compose — 一键启动 AI 数据分析助手
+#
+# 使用方式:
+#   1. 复制 .env.example 为 .env 并填入 API Key
+#   2. docker-compose up -d
+#   3. 打开 http://localhost:8501
+# ============================================================
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: ai-data-analyst
+    ports:
+      - "8501:8501"
+    volumes:
+      # 数据持久化：数据库和历史记录保存在本地，容器删除不丢失
+      - ./data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
