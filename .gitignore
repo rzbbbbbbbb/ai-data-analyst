@@ -9,6 +9,7 @@ __pycache__/
 # 数据
 data/uploads/*
 data/*.db
+data/*.json
 *.db
 
 # 系统

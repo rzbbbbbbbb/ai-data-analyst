@@ -13,10 +13,21 @@
 
 ## 📸 功能预览
 
-| 智能问答 | 数据可视化 | 质量报告 |
-|:---:|:---:|:---:|
-| 自然语言 → SQL → 结果 | 自动推荐图表类型 | 逐列缺失率/唯一值分析 |
-| 支持 CTE / 窗口函数 / 环比 | Bar / Line / Pie / Scatter | 高频值分布 |
+### 智能问答 —— 自然语言 → SQL → 表格 + 图表 + 洞察
+
+![智能问答结果](docs/screenshots/智能问答结果页.jpg)
+
+### 数据可视化 —— Plotly 交互式图表，自动推荐类型
+
+![图表](docs/screenshots/图表.jpg)
+
+### 质量报告 —— 逐列缺失率、唯一值、高频值分析
+
+![质量报告](docs/screenshots/质量报告.jpg)
+
+### AI 数据洞察 —— 基于实际数据生成业务分析报告
+
+![AI数据洞察](docs/screenshots/AI数据洞察.jpg)
 
 ---
 
@@ -58,7 +69,7 @@ src/
 ### 1. 克隆项目
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/rzbbbbbbbb/ai-data-analyst.git
 cd ai-data-analyst
 ```
 
