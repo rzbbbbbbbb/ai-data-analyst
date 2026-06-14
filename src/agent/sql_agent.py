@@ -24,6 +24,7 @@ from langchain_community.agent_toolkits import create_sql_agent
 from langchain.agents.agent_types import AgentType
 from src.config import config
 from src.database.schema import get_table_schema_for_llm
+from src.agent.conversation import format_context_for_llm, get_last_n_messages
 from sqlalchemy import create_engine
 
 
@@ -169,13 +170,19 @@ class SQLAnalystAgent:
     # 公开方法
     # ---------------------------------------------------------------
 
-    def query(self, question: str, current_table: str | None = None) -> dict:
+    def query(
+        self,
+        question: str,
+        current_table: str | None = None,
+        conversation_history: list[dict] | None = None,
+    ) -> dict:
         """
         执行自然语言查询。
 
         Args:
             question: 用户的自然语言问题，如"上个月各品类的销售额排名"
             current_table: 当前用户选中的表名，用于强调优先使用
+            conversation_history: 对话历史消息列表（最近 N 条），用于多轮对话上下文
 
         Returns:
             {
@@ -187,12 +194,22 @@ class SQLAnalystAgent:
             }
         """
         try:
-            # 如果指定了当前表，在问题前加上上下文提示
+            # 构建增强问题：表上下文 + 对话历史 + 用户问题
             enhanced_question = question
+
+            # 1. 当前表提示
             if current_table:
                 enhanced_question = (
-                    f"【当前工作表: \"{current_table}\"，请使用这张表来回答问题】\n{question}"
+                    f"【当前工作表: \"{current_table}\"，请使用这张表来回答问题】\n{enhanced_question}"
                 )
+
+            # 2. 对话历史上下文（多轮对话能力）
+            if conversation_history:
+                context = format_context_for_llm(conversation_history)
+                if context:
+                    enhanced_question = (
+                        f"{context}\n## 当前问题\n{enhanced_question}"
+                    )
 
             # 调用 Agent
             response = self.agent_executor.invoke({"input": enhanced_question})

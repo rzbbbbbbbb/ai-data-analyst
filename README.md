@@ -7,7 +7,7 @@
 [![LangChain](https://img.shields.io/badge/LangChain-0.3-green.svg)](https://www.langchain.com/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-上传 CSV/Excel 文件，用**自然语言**提问，AI 自动生成 SQL、执行查询、绘制图表、输出业务洞察。
+上传 CSV/Excel 文件，用**自然语言**提问，AI 自动生成 SQL、执行查询、绘制图表、输出业务洞察。支持**多轮对话**，像和数据分析师聊天一样逐层深入挖掘数据。
 
 ---
 
@@ -37,12 +37,12 @@
 flowchart LR
     A[📤 文件上传<br/>CSV / Excel] --> B[🧹 数据清洗<br/>去重 / 去空 / 列名规范化]
     B --> C[🗄️ Schema 推断<br/>类型映射 + 建表]
-    C --> D[💬 自然语言提问]
-    D --> E[🤖 LangChain SQL Agent<br/>Schema 注入 + Prompt Engineering]
+    C --> D[💬 多轮对话<br/>自然语言提问 + 追问]
+    D --> E[🤖 LangChain SQL Agent<br/>Schema 注入 + 对话上下文 + Prompt Engineering]
     E --> F[📝 SQL 生成 + 执行]
     F --> G[📊 自动可视化<br/>Plotly 图表]
     F --> H[💡 AI 数据洞察<br/>业务解读 + 建议]
-    G & H --> I[💾 查询历史<br/>持久化 / 回看 / 删除]
+    G & H --> I[💾 对话持久化<br/>跨会话恢复 / 继续追问]
 ```
 
 ```
@@ -55,7 +55,8 @@ src/
 │   ├── connection.py      # SQLAlchemy 连接管理（SQLite / PostgreSQL）
 │   └── schema.py          # Schema 推断 + 高性能批量入库 + 质量报告
 ├── agent/
-│   └── sql_agent.py       # LangChain SQL Agent（核心：NL → SQL）
+│   ├── sql_agent.py       # LangChain SQL Agent（核心：NL → SQL）
+│   └── conversation.py    # 多轮对话模型 + 上下文注入
 ├── insights/
 │   └── generator.py       # AI 洞察生成（基于原始数据，非 LLM 转述）
 └── visualization/
@@ -176,6 +177,12 @@ docker-compose logs -f
 
 ## 💡 核心能力
 
+### 多轮对话
+- **上下文记忆**：LLM 接收最近 3 轮 Q&A 历史，理解"只看前 5 个""用饼图展示"等追问
+- **对话持久化**：对话保存到 JSON 文件，关闭浏览器后重新打开可继续追问
+- **多会话管理**：支持创建多个独立对话，切换表时自动提示新建对话
+- **上下文窗口控制**：只传递最近 N 轮对话给 LLM，平衡记忆与 token 消耗
+
 ### 智能 SQL 生成
 - **Schema 注入**：建表时自动提取列名、类型、统计值、样本行，全部注入 System Prompt
 - **Few-shot 示例**：Prompt 内置环比增长率、Top-N 排名、分层分析等 SQL 模板
@@ -213,7 +220,7 @@ docker-compose logs -f
 ## 🧪 运行测试
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v          # 86 条测试，覆盖 SQL 提取 / Schema 推断 / 数据清洗 / 图表 / 多轮对话
 ```
 
 ---
@@ -226,6 +233,15 @@ pytest tests/ -v
 - 「按区域分析客单价分布，找出高价值区域」
 - 「各品类的月度销量趋势，用 CTE + 窗口函数」
 - 「分析复购率最高的前 10 个用户」
+
+**多轮追问示例：**
+
+- 你先问：「各区域的销售额排名」
+- AI 返回结果后，追问：「**只看前 3 个**」
+- 再追问：「**用饼图展示它们的占比**」
+- 最后问：「**对比去年同期，排名有什么变化**」
+
+每次追问 LLM 都能看到前面的对话上下文，理解"它们"指的是前 3 个区域。
 
 ---
 

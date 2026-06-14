@@ -20,6 +20,11 @@ from src.data_loader.cleaner import clean_dataframe
 from src.database.schema import create_table_from_df, get_data_quality_report
 from src.database.connection import execute_sql, get_all_tables
 from src.agent.sql_agent import get_agent
+from src.agent.conversation import (
+    create_conversation, add_message,
+    format_context_for_llm, build_result_summary,
+    get_last_n_messages,
+)
 from src.insights.generator import InsightsGenerator
 from src.visualization.charts import (
     create_chart, suggest_chart_type, result_to_df,
@@ -77,6 +82,49 @@ def _save_history_to_disk():
         pass
 
 
+def _save_conversations_to_disk():
+    """将对话记录持久化到磁盘"""
+    import json
+    conv_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations.json")
+    os.makedirs(os.path.dirname(conv_file), exist_ok=True)
+    # 每条消息的 query_data 最多保留 500 行
+    convs_to_save = {}
+    for cid, conv in st.session_state.conversations.items():
+        conv_copy = dict(conv)
+        msgs_to_save = []
+        for msg in conv.get("messages", []):
+            msg_copy = dict(msg)
+            qd = msg_copy.get("query_data", [])
+            if len(qd) > 500:
+                msg_copy["query_data"] = qd[:500]
+                msg_copy["_truncated"] = True
+            msgs_to_save.append(msg_copy)
+        conv_copy["messages"] = msgs_to_save
+        convs_to_save[cid] = conv_copy
+    try:
+        with open(conv_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "conv_list": st.session_state.conv_list,
+                "conversations": convs_to_save,
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _load_conversations_from_disk():
+    """从磁盘恢复对话记录"""
+    import json
+    conv_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations.json")
+    if os.path.exists(conv_file):
+        try:
+            with open(conv_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("conv_list", []), data.get("conversations", {})
+        except Exception:
+            pass
+    return [], {}
+
+
 defaults = {
     "tables": {},               # {table_name: stats_dict}
     "current_table": None,      # 当前选中的表名
@@ -84,18 +132,26 @@ defaults = {
     "query_results": {},        # {history_id: {question, sql, answer, query_data, insight, chart_type, time}}
     "viewing_history_id": None, # 当前正在查看的历史记录 ID
     "last_sql": "",             # 最近一次执行的 SQL（用于自定义 SQL tab 预填）
+    # 多轮对话
+    "conversations": {},        # {conv_id: conversation_dict}
+    "current_conv_id": None,    # 当前活跃的对话 ID
+    "conv_list": [],            # [conv_id] 按时间排序的对话 ID 列表
 }
 for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# 从磁盘恢复历史记录（仅首次加载时）
+# 从磁盘恢复历史记录和对话（仅首次加载时）
 if "_history_loaded" not in st.session_state:
     st.session_state._history_loaded = True
     saved_ids, saved_results = _load_history_from_disk()
     if saved_ids:
         st.session_state.query_history = saved_ids
         st.session_state.query_results = saved_results
+    saved_conv_list, saved_convs = _load_conversations_from_disk()
+    if saved_conv_list:
+        st.session_state.conv_list = saved_conv_list
+        st.session_state.conversations = saved_convs
 
 
 # ============================================================
@@ -323,59 +379,128 @@ with st.sidebar:
                         st.session_state.query_history.remove(hid)
                 if st.session_state.viewing_history_id in related_history:
                     st.session_state.viewing_history_id = None
+                # 4. 清理该表相关的对话
+                related_convs = [
+                    cid for cid, conv in st.session_state.conversations.items()
+                    if conv.get("table") == table_to_drop
+                ]
+                for cid in related_convs:
+                    st.session_state.conversations.pop(cid, None)
+                    if cid in st.session_state.conv_list:
+                        st.session_state.conv_list.remove(cid)
+                if st.session_state.current_conv_id in related_convs:
+                    st.session_state.current_conv_id = None
                 _save_history_to_disk()
+                _save_conversations_to_disk()
                 st.rerun()
     else:
         st.info("暂无数据，请上传文件")
 
     st.divider()
 
-    # ---- 查询历史 ----
-    if st.session_state.query_history:
-        st.subheader("📝 查询历史")
+    # ---- 多轮对话列表 ----
+    st.subheader("💬 对话")
 
-        # 显示最近 20 条，每条是一行：查看按钮 + 删除按钮
-        history_ids = list(reversed(st.session_state.query_history[-20:]))
-        for hid in history_ids:
-            entry = st.session_state.query_results.get(hid, {})
-            question_text = entry.get("question", hid)
-            time_text = entry.get("time", "")
-            label = f"{time_text}  {question_text[:30]}{'...' if len(question_text) > 30 else ''}"
+    # 新建对话按钮
+    if st.button("＋ 新对话", use_container_width=True, key="new_conv_btn"):
+        st.session_state.current_conv_id = None
+        st.session_state.viewing_history_id = None
+        st.session_state.user_query = ""
+        st.rerun()
 
-            # 高亮当前正在查看的条目
-            is_active = st.session_state.viewing_history_id == hid
+    if st.session_state.conv_list:
+        # 显示最近 20 个对话
+        conv_ids = list(reversed(st.session_state.conv_list[-20:]))
+        for cid in conv_ids:
+            conv = st.session_state.conversations.get(cid, {})
+            if not conv:
+                continue
+            title = conv.get("title", cid)
+            msg_count = len(conv.get("messages", []))
+            updated = conv.get("updated_at", "")[-8:] or conv.get("created_at", "")[-8:]  # 时间部分
+            table_name = conv.get("table", "")
+            is_active = st.session_state.current_conv_id == cid
 
-            col_hist, col_del = st.columns([9, 1])
-            with col_hist:
-                btn_type = "secondary" if not is_active else "primary"
-                btn_label = ("🔍 " if is_active else "") + label
+            col_conv, col_del = st.columns([9, 1])
+            with col_conv:
+                btn_type = "primary" if is_active else "secondary"
+                btn_label = f"{'💬 ' if is_active else ''}{title[:25]}{'…' if len(title) > 25 else ''}"
                 if st.button(
                     btn_label,
-                    key=f"hist_{hid}",
+                    key=f"conv_{cid}",
                     use_container_width=True,
                     type=btn_type,
-                    help=question_text,
+                    help=f"表: {table_name} · {msg_count} 条消息 · {updated}",
                 ):
-                    st.session_state.viewing_history_id = hid
-                    st.session_state.user_query = question_text
+                    st.session_state.current_conv_id = cid
+                    st.session_state.viewing_history_id = None
+                    st.session_state.user_query = ""
                     st.rerun()
             with col_del:
-                if st.button("✕", key=f"del_{hid}", help=f"删除: {question_text[:30]}"):
-                    st.session_state.query_history.remove(hid)
-                    st.session_state.query_results.pop(hid, None)
-                    if st.session_state.viewing_history_id == hid:
-                        st.session_state.viewing_history_id = None
-                    _save_history_to_disk()
+                if st.button("✕", key=f"cdel_{cid}", help=f"删除对话: {title[:30]}"):
+                    st.session_state.conversations.pop(cid, None)
+                    if cid in st.session_state.conv_list:
+                        st.session_state.conv_list.remove(cid)
+                    if st.session_state.current_conv_id == cid:
+                        st.session_state.current_conv_id = None
+                    _save_conversations_to_disk()
                     st.rerun()
 
-        # 清空全部历史按钮
-        if st.button("🗑️ 清空全部历史", use_container_width=True):
-            st.session_state.query_history = []
-            st.session_state.query_results = {}
-            st.session_state.viewing_history_id = None
-            st.session_state.user_query = ""
-            _save_history_to_disk()
+        # 清空全部对话
+        if st.button("🗑️ 清空全部对话", use_container_width=True, key="clear_all_convs"):
+            st.session_state.conversations = {}
+            st.session_state.conv_list = []
+            st.session_state.current_conv_id = None
+            _save_conversations_to_disk()
             st.rerun()
+    else:
+        st.caption("暂无对话，开始提问吧")
+
+    st.divider()
+
+    # ---- 查询历史（保留为辅助功能） ----
+    if st.session_state.query_history:
+        with st.expander("📝 历史查询记录", expanded=False):
+            history_ids = list(reversed(st.session_state.query_history[-20:]))
+            for hid in history_ids:
+                entry = st.session_state.query_results.get(hid, {})
+                question_text = entry.get("question", hid)
+                time_text = entry.get("time", "")
+                label = f"{time_text}  {question_text[:30]}{'...' if len(question_text) > 30 else ''}"
+
+                is_active = st.session_state.viewing_history_id == hid
+
+                col_hist, col_del = st.columns([9, 1])
+                with col_hist:
+                    btn_type = "secondary" if not is_active else "primary"
+                    btn_label = ("🔍 " if is_active else "") + label
+                    if st.button(
+                        btn_label,
+                        key=f"hist_{hid}",
+                        use_container_width=True,
+                        type=btn_type,
+                        help=question_text,
+                    ):
+                        st.session_state.viewing_history_id = hid
+                        st.session_state.user_query = question_text
+                        st.session_state.current_conv_id = None  # 退出对话模式
+                        st.rerun()
+                with col_del:
+                    if st.button("✕", key=f"del_{hid}", help=f"删除: {question_text[:30]}"):
+                        st.session_state.query_history.remove(hid)
+                        st.session_state.query_results.pop(hid, None)
+                        if st.session_state.viewing_history_id == hid:
+                            st.session_state.viewing_history_id = None
+                        _save_history_to_disk()
+                        st.rerun()
+
+            if st.button("🗑️ 清空全部历史", use_container_width=True, key="clear_all_hist"):
+                st.session_state.query_history = []
+                st.session_state.query_results = {}
+                st.session_state.viewing_history_id = None
+                st.session_state.user_query = ""
+                _save_history_to_disk()
+                st.rerun()
 
     st.divider()
     st.caption("💡 LangChain + OpenAI + Streamlit")
@@ -419,55 +544,12 @@ if not st.session_state.current_table:
 tabs = st.tabs(["💬 智能问答", "📋 数据预览", "📊 质量报告", "🔍 自定义 SQL"])
 
 # ============================================================
-# Tab 1: 智能问答（核心功能）
+# Tab 1: 智能问答（多轮对话）
 # ============================================================
 with tabs[0]:
-    st.subheader("🤖 用自然语言提问，AI 自动生成 SQL 并执行")
-
     table_name = st.session_state.current_table
 
-    # 快捷问题推荐
-    st.caption("💡 试试这些问题：")
-
-    if "sales" in table_name.lower():
-        suggestions = [
-            "每个月的销售额趋势和环比增长率",
-            "各区域的销售额占比排名",
-            "销售额最高的前10个商品",
-            "各品类的月度销量对比",
-            "分析客单价的变化趋势",
-        ]
-    elif "user" in table_name.lower():
-        suggestions = [
-            "各城市的用户数量和消费总额排名",
-            "VIP用户和非VIP用户的消费对比",
-            "用户年龄分布和消费能力分析",
-            "注册时间趋势分析",
-            "复购率最高的城市",
-        ]
-    else:
-        suggestions = [
-            f"统计{table_name}表的基本信息",
-            "按主要维度分组统计数量",
-            "分析数值列的分布情况",
-            "找出数据的趋势和异常点",
-        ]
-
-    cols = st.columns(len(suggestions))
-    for i, s in enumerate(suggestions):
-        with cols[i]:
-            if st.button(s, key=f"sug_{i}", use_container_width=True):
-                st.session_state.user_query = s
-                st.session_state.viewing_history_id = None  # 切回新建模式
-                st.rerun()
-
-    st.divider()
-
-    # 初始化
-    if "user_query" not in st.session_state:
-        st.session_state.user_query = ""
-
-    # ---- 如果正在查看历史记录，显示"返回最新"按钮 ----
+    # ---- 正在查看历史记录 ----
     if st.session_state.viewing_history_id:
         hist_entry = st.session_state.query_results.get(
             st.session_state.viewing_history_id, {}
@@ -481,7 +563,6 @@ with tabs[0]:
                 st.session_state.user_query = ""
                 st.rerun()
 
-        # 直接渲染历史结果
         hist_result = {
             "id": st.session_state.viewing_history_id,
             "question": hist_entry.get("question", ""),
@@ -494,30 +575,152 @@ with tabs[0]:
         render_query_result(hist_result)
 
     else:
-        # ---- 正常模式：输入 + 执行 ----
-        st.caption("🔍 输入你的业务问题")
-        col_input, col_btn = st.columns([5, 1])
-        with col_input:
-            question = st.text_input(
-                "业务问题",
-                key="user_query",
-                placeholder="例如：各区域的销售额排名和环比变化趋势",
-                label_visibility="collapsed",
+        # ---- 对话模式 ----
+        current_conv = st.session_state.conversations.get(
+            st.session_state.current_conv_id, {}
+        ) if st.session_state.current_conv_id else None
+        messages = current_conv.get("messages", []) if current_conv else []
+
+        # 表切换警告
+        if current_conv and current_conv.get("table") != table_name:
+            st.warning(
+                f"⚠️ 当前对话基于表 **{current_conv.get('table')}**，"
+                f"你已切换到表 **{table_name}**。建议新建对话。"
             )
 
-        with col_btn:
-            go = st.button("🚀 开始分析", type="primary", use_container_width=True)
+        # 快捷问题推荐（仅在无对话消息时显示）
+        if not messages:
+            st.subheader("🤖 用自然语言提问，AI 自动生成 SQL 并执行")
+            st.caption("💡 试试这些问题：")
 
-        if go and question.strip():
+            if "sales" in table_name.lower():
+                suggestions = [
+                    "每个月的销售额趋势和环比增长率",
+                    "各区域的销售额占比排名",
+                    "销售额最高的前10个商品",
+                    "各品类的月度销量对比",
+                    "分析客单价的变化趋势",
+                ]
+            elif "user" in table_name.lower():
+                suggestions = [
+                    "各城市的用户数量和消费总额排名",
+                    "VIP用户和非VIP用户的消费对比",
+                    "用户年龄分布和消费能力分析",
+                    "注册时间趋势分析",
+                    "复购率最高的城市",
+                ]
+            else:
+                suggestions = [
+                    f"统计{table_name}表的基本信息",
+                    "按主要维度分组统计数量",
+                    "分析数值列的分布情况",
+                    "找出数据的趋势和异常点",
+                ]
+
+            cols = st.columns(len(suggestions))
+            for i, s in enumerate(suggestions):
+                with cols[i]:
+                    if st.button(s, key=f"sug_{i}", use_container_width=True):
+                        st.session_state.user_query = s
+                        st.rerun()
+
+            st.divider()
+
+        # ---- 渲染对话消息气泡 ----
+        if messages:
+            st.subheader(f"💬 {current_conv.get('title', '对话')}")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "user")
+                with st.chat_message(role):
+                    if role == "user":
+                        st.markdown(msg.get("content", ""))
+                        st.caption(msg.get("time", ""))
+                    else:
+                        # Assistant 消息：SQL + 数据 + 图表 + 洞察
+                        sql = msg.get("sql", "")
+                        query_data = msg.get("query_data", [])
+                        insight = msg.get("insight", "")
+                        chart_type = msg.get("chart_type", "bar")
+                        answer = msg.get("content", "")
+
+                        if sql:
+                            with st.expander("📝 查看 SQL", expanded=False):
+                                st.code(sql, language="sql")
+                                # 复制到自定义 SQL
+                                if st.button("📋 复制 SQL 到自定义查询",
+                                             key=f"copy_sql_{current_conv['id']}_{i}"):
+                                    st.session_state.custom_sql_input = sql
+                                    st.success("✅ 已复制，请切换到「🔍 自定义 SQL」tab 查看")
+
+                        if query_data:
+                            with st.expander("📊 查看数据表", expanded=False):
+                                df_result = pd.DataFrame(query_data)
+                                st.dataframe(
+                                    df_result,
+                                    use_container_width=True,
+                                    height=min(400, 35 * len(df_result) + 38),
+                                )
+
+                            # 图表
+                            chart_options = ["bar", "line", "pie", "scatter"]
+                            default_idx = chart_options.index(chart_type) if chart_type in chart_options else 0
+                            col_ct, _, _, _, _ = st.columns(5)
+                            with col_ct:
+                                chart_choice = st.selectbox(
+                                    "图表类型",
+                                    chart_options,
+                                    index=default_idx,
+                                    key=f"chart_type_{current_conv['id']}_{i}",
+                                )
+                            fig = create_chart(query_data, chart_type=chart_choice)
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            # CSV 下载
+                            csv = df_result.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "📥 下载结果 CSV",
+                                csv,
+                                "query_result.csv",
+                                "text/csv",
+                                key=f"dl_{current_conv['id']}_{i}",
+                            )
+                        elif answer:
+                            st.markdown(answer)
+                        else:
+                            st.info("无返回数据")
+
+                        # AI 洞察
+                        if insight:
+                            with st.expander("💡 AI 数据洞察", expanded=False):
+                                st.markdown(insight)
+
+                        st.caption(msg.get("time", ""))
+
+        # ---- 输入区域 ----
+        # 处理 user_query（来自快捷按钮）
+        if "user_query" in st.session_state and st.session_state.user_query.strip():
+            question = st.session_state.user_query.strip()
+            st.session_state.user_query = ""  # 立即清空避免重复触发
+        else:
+            question = st.chat_input("输入追问或新问题...")
+
+        if question:
             with st.spinner("🤔 AI 正在分析..."):
                 try:
                     agent = get_agent()
-                    result = agent.query(question, current_table=table_name)
+
+                    # 构建对话历史上下文（不包含当前问题）
+                    conv_history = None
+                    if messages:
+                        conv_history = get_last_n_messages(messages, 6)
+
+                    result = agent.query(
+                        question,
+                        current_table=table_name,
+                        conversation_history=conv_history,
+                    )
 
                     if result["success"]:
-                        # 生成历史 ID
-                        history_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
                         # 重新执行 SQL，获取结构化数据
                         query_data = []
                         sql_exec_error = None
@@ -527,20 +730,19 @@ with tabs[0]:
                             except Exception as e:
                                 sql_exec_error = str(e)
 
-                        # 如果 SQL 重执行失败，显示警告
                         if sql_exec_error:
                             st.warning(f"⚠️ SQL 重执行失败: {sql_exec_error}")
                         elif result.get("sql") and not query_data:
                             st.info("ℹ️ SQL 执行成功，但未返回数据（可能为空结果集）")
 
-                        # AI 洞察（直接基于原始查询数据，不依赖 Agent 文字转述）
+                        # AI 洞察
                         insight_text = ""
                         try:
                             insights_gen = InsightsGenerator()
                             insight_text = insights_gen.generate(
                                 question=question,
                                 sql=result.get("sql", ""),
-                                query_data=query_data,          # 传入原始数据
+                                query_data=query_data,
                                 table_context=table_name,
                             )
                         except Exception:
@@ -551,7 +753,38 @@ with tabs[0]:
                         if query_data:
                             chart_type = suggest_chart_type(query_data)
 
-                        # ---- 保存完整结果到 session_state ----
+                        # ---- 创建或更新对话 ----
+                        if not current_conv:
+                            # 自动创建新对话
+                            current_conv = create_conversation(
+                                title=question,
+                                table_name=table_name,
+                            )
+                            cid = current_conv["id"]
+                            st.session_state.conversations[cid] = current_conv
+                            st.session_state.conv_list.append(cid)
+                            st.session_state.current_conv_id = cid
+
+                            # 限制对话数量
+                            if len(st.session_state.conv_list) > 50:
+                                oldest_cid = st.session_state.conv_list.pop(0)
+                                st.session_state.conversations.pop(oldest_cid, None)
+
+                        cid = current_conv["id"]
+
+                        # 添加消息到对话
+                        add_message(current_conv, "user", question)
+                        add_message(
+                            current_conv, "assistant",
+                            result.get("answer", ""),
+                            sql=result.get("sql", ""),
+                            query_data=query_data,
+                            insight=insight_text,
+                            chart_type=chart_type,
+                        )
+
+                        # ---- 同时保存到旧查询历史（向后兼容） ----
+                        history_id = datetime.now().strftime("%Y%m%d_%H%M%S")
                         history_entry = {
                             "id": history_id,
                             "question": question,
@@ -564,28 +797,29 @@ with tabs[0]:
                         }
                         st.session_state.query_results[history_id] = history_entry
                         st.session_state.query_history.append(history_id)
-                        st.session_state.viewing_history_id = None
                         st.session_state.last_sql = result.get("sql") or ""
-                        _save_history_to_disk()  # 持久化到磁盘
 
-                        # 限制历史数量（最多 50 条）
                         if len(st.session_state.query_history) > 50:
                             oldest = st.session_state.query_history.pop(0)
                             st.session_state.query_results.pop(oldest, None)
 
-                        # ---- 渲染结果 ----
-                        render_query_result({
-                            "id": history_id,
-                            "question": question,
-                            "sql": result.get("sql", ""),
-                            "answer": result.get("answer", ""),
-                            "query_data": query_data,
-                            "insight": insight_text,
-                            "chart_type": chart_type,
-                        })
+                        # 持久化
+                        _save_history_to_disk()
+                        _save_conversations_to_disk()
+
+                        st.rerun()
 
                     else:
                         st.error(f"❌ {result.get('error', '查询失败')}")
+                        # 即使失败也添加消息到对话（记录错误）
+                        if current_conv:
+                            add_message(current_conv, "user", question)
+                            add_message(
+                                current_conv, "assistant",
+                                f"查询失败: {result.get('error', '未知错误')}",
+                                sql="",
+                            )
+                            _save_conversations_to_disk()
 
                 except Exception as e:
                     st.error(f"❌ 出错了: {str(e)}")
