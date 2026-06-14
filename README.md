@@ -66,22 +66,43 @@ src/
 
 ## 🚀 快速开始
 
-### 1. 克隆项目
+### 方式一：Docker 一键部署（推荐 ⭐）
+
+> 无需安装 Python，只需 Docker。适合快速体验。
 
 ```bash
+# 1. 克隆项目
 git clone https://github.com/rzbbbbbbbb/ai-data-analyst.git
 cd ai-data-analyst
+
+# 2. 配置 API Key
+cp .env.example .env
+# 编辑 .env，填入你的 OPENAI_API_KEY
+
+# 3. 一键启动
+docker-compose up -d
+
+# 4. 浏览器打开
+# http://localhost:8501
 ```
 
-### 2. 安装依赖
+**停止服务：** `docker-compose down`
+
+> 💡 数据库和查询历史保存在 `./data` 目录，容器删除后数据不丢失。
+
+---
+
+### 方式二：手动安装
 
 ```bash
+# 1. 克隆
+git clone https://github.com/rzbbbbbbbb/ai-data-analyst.git
+cd ai-data-analyst
+
+# 2. 安装依赖（需 Python 3.9+）
 pip install -r requirements.txt
-```
 
-### 3. 配置 API Key
-
-```bash
+# 3. 配置 API Key
 cp .env.example .env
 ```
 
@@ -96,9 +117,8 @@ LLM_MODEL=gpt-4o-mini
 
 > 💡 兼容所有 OpenAI 格式的 API，包括 DeepSeek、通义千问、智谱 GLM 等。
 
-### 4. 启动
-
 ```bash
+# 4. 启动
 streamlit run streamlit_app.py
 ```
 
@@ -106,11 +126,51 @@ streamlit run streamlit_app.py
 
 ---
 
-## 🐳 Docker 部署
+## 🐳 Docker 部署详解
+
+### 前置要求
+- 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)（Windows/Mac）或 Docker Engine（Linux）
+
+### 部署步骤
 
 ```bash
+# 1. 克隆项目
+git clone https://github.com/rzbbbbbbbb/ai-data-analyst.git
+cd ai-data-analyst
+
+# 2. 配置 API Key（从 .env.example 复制模板）
+cp .env.example .env
+# 用文本编辑器打开 .env，填入：
+#   OPENAI_API_KEY=你的密钥
+#   OPENAI_BASE_URL=你的API地址
+#   LLM_MODEL=模型名称
+
+# 3. 构建并启动
 docker-compose up -d
+
+# 4. 查看日志（确认启动成功）
+docker-compose logs -f
 ```
+
+浏览器打开 **http://localhost:8501**。
+
+### 常用命令
+
+| 命令 | 作用 |
+|:---|:---|
+| `docker-compose up -d` | 后台启动 |
+| `docker-compose down` | 停止并删除容器 |
+| `docker-compose logs -f` | 查看实时日志 |
+| `docker-compose restart` | 重启服务 |
+| `docker-compose ps` | 查看运行状态 |
+
+### 文件说明
+
+| 文件 | 作用 |
+|:---|:---|
+| `Dockerfile` | 镜像构建定义（Python 3.11 + 依赖） |
+| `docker-compose.yml` | 编排配置（端口 8501 + 数据持久化） |
+| `.env` | API 密钥配置（不入 git，需自行创建） |
 
 ---
 
